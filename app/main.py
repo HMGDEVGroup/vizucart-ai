@@ -6,40 +6,70 @@ from typing import List, Optional, Dict, Any, Tuple
 
 import requests
 import cv2
-from fastapi import FastAPI, HTTPException, UploadFile, File
+
+from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
 # -----------------------------
 # Config
 # -----------------------------
+DOWNLOAD_TIMEOUT_SEC = 15
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
-DOWNLOAD_TIMEOUT_SEC = 30
+
+# -----------------------------
+# FastAPI App
+# -----------------------------
+app = FastAPI(title="Vizucart AI API", version="1.0.0")
+
+# Allow everything for dev (you can restrict later)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # -----------------------------
-# API Models
+# Root + Health Endpoints
+# -----------------------------
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "vizucart-ai"}
+
+# ✅ ADD THIS: fixes Render/Cloudflare HEAD checks
+@app.head("/")
+def head_root():
+    return
+
+
+# -----------------------------
+# Request / Response Models
 # -----------------------------
 class DetectImageRequest(BaseModel):
-    postId: str
-    imageUrl: str
+    postId: str = Field(..., description="Client post ID")
+    imageUrl: str = Field(..., description="Public image URL")
 
 
 class DetectVideoRequest(BaseModel):
-    postId: str
-    videoUrl: str
-    sampleFps: float = 1.0
-    maxFrames: int = 4
+    postId: str = Field(..., description="Client post ID")
+    videoUrl: str = Field(..., description="Public video URL")
+    sampleFps: float = Field(1.0, description="Frames per second to sample")
+    maxFrames: int = Field(4, description="Max number of frames to analyze")
 
 
 class DetectResponseObject(BaseModel):
     label: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    startTimeMs: int = 0
-    endTimeMs: int = 0
+    confidence: float
+    startTimeMs: Optional[int] = None
+    endTimeMs: Optional[int] = None
 
 
 class DetectResponse(BaseModel):
@@ -48,30 +78,14 @@ class DetectResponse(BaseModel):
 
 
 # -----------------------------
-# FastAPI
-# -----------------------------
-app = FastAPI(title="Vizucart AI", version="1.0.0")
-
-
-@app.get("/")
-def root():
-    # Prevent confusing 404s for Render HEAD/GET /
-    return {"name": "Vizucart AI", "status": "ok", "health": "/health", "docs": "/docs"}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# -----------------------------
-# Helpers: Download + Encode
+# Helpers
 # -----------------------------
 def _download_bytes(url: str) -> bytes:
     headers = {
-        "User-Agent": "VizucartAI/1.0 (+https://vizucart.ai)",
+        "User-Agent": "vizucart-ai/1.0",
         "Accept": "*/*",
     }
+
     try:
         resp = requests.get(
             url,
@@ -95,16 +109,19 @@ def _download_bytes(url: str) -> bytes:
 
 
 def _bytes_to_data_url(image_bytes: bytes, mime: str) -> str:
+    # OpenAI supports base64 data URLs
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
 
 def _infer_mime_from_url(url: str) -> str:
-    lower = url.lower()
-    if lower.endswith(".png"):
+    u = url.lower()
+    if u.endswith(".png"):
         return "image/png"
-    if lower.endswith(".webp"):
+    if u.endswith(".webp"):
         return "image/webp"
+    if u.endswith(".gif"):
+        return "image/gif"
     return "image/jpeg"
 
 
@@ -119,36 +136,17 @@ def _jpeg_encode_bgr(frame_bgr) -> bytes:
     return buf.tobytes()
 
 
-# -----------------------------
-# Helper: Validate video uploads (robust for curl/octet-stream)
-# -----------------------------
-def _is_video_upload(file: UploadFile) -> bool:
-    ct = (file.content_type or "").lower().strip()
-    name = (file.filename or "").lower().strip()
-
-    if ct.startswith("video/"):
-        return True
-
-    # Some clients send octet-stream; trust extension
-    if ct in ("application/octet-stream", ""):
-        return name.endswith((".mp4", ".mov", ".m4v", ".webm"))
-
-    # Other hints
-    if "mp4" in ct or "quicktime" in ct or "webm" in ct:
-        return True
-
-    return name.endswith((".mp4", ".mov", ".m4v", ".webm"))
-
-
-# -----------------------------
-# Helper: Sample video frames from a local file path
-# -----------------------------
 def _sample_video_frames_from_path(
     *,
     video_path: str,
     sample_fps: float,
     max_frames: int,
 ) -> Tuple[List[str], List[Dict[str, int]]]:
+    """
+    Returns:
+      frames_data_urls: list of base64 data URLs (JPEG frames)
+      time_windows: list of {"start":ms,"end":ms} for each frame
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise HTTPException(status_code=400, detail="Failed to open video")
@@ -158,9 +156,9 @@ def _sample_video_frames_from_path(
         fps = 30.0
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration_sec = (total_frames / fps) if total_frames > 0 else 0.0
+    duration_sec = (total_frames / fps) if total_frames > 0 else 0
 
-    # Want ~sample_fps frames per second, cap at max_frames
+    # We want ~sample_fps frames per second, but cap at max_frames
     sample_every_n = max(int(round(fps / max(sample_fps, 0.1))), 1)
 
     frames_data_urls: List[str] = []
@@ -181,17 +179,22 @@ def _sample_video_frames_from_path(
                 continue
 
             jpeg_bytes = _jpeg_encode_bgr(frame)
-            frames_data_urls.append(_bytes_to_data_url(jpeg_bytes, "image/jpeg"))
+            data_url = _bytes_to_data_url(jpeg_bytes, "image/jpeg")
 
+            # Time window for this sampled frame
             t_sec = frame_index / fps
             start_ms = int(t_sec * 1000)
 
             if duration_sec > 0:
-                end_sec = min(t_sec + (1.0 / max(sample_fps, 0.1)), duration_sec)
+                end_sec = min(
+                    (t_sec + (1.0 / max(sample_fps, 0.1))),
+                    duration_sec,
+                )
                 end_ms = int(end_sec * 1000)
             else:
                 end_ms = start_ms
 
+            frames_data_urls.append(data_url)
             time_windows.append({"start": start_ms, "end": end_ms})
             grabbed += 1
 
@@ -220,35 +223,32 @@ def _openai_detect_objects_from_images(
     timing_hint = ""
     if time_windows_ms and len(time_windows_ms) == len(image_data_urls):
         timing_hint = (
-            "You are seeing multiple video frames. "
-            "Use the provided frame time windows to populate startTimeMs/endTimeMs."
+            "For each object, include startTimeMs and endTimeMs matching the frame timeWindowMs.\n"
         )
 
-    system_text = (
-        "You are Vizucart's object detection assistant. "
-        "Identify tangible, shoppable items in the image(s). "
-        "Return ONLY valid JSON (no markdown)."
-    )
-
-    user_text = (
-        f"PostId: {post_id}\n"
-        f"{timing_hint}\n\n"
-        "Return JSON with this exact schema:\n"
+    system_prompt = (
+        "You are a precise computer vision assistant.\n"
+        "Return ONLY strict JSON with this schema:\n"
         "{\n"
         '  "objects": [\n'
         "    {\n"
         '      "label": string,\n'
-        '      "confidence": number (0 to 1),\n'
-        '      "startTimeMs": integer,\n'
-        '      "endTimeMs": integer\n'
+        '      "confidence": number,\n'
+        '      "startTimeMs": number|null,\n'
+        '      "endTimeMs": number|null\n'
         "    }\n"
         "  ]\n"
-        "}\n\n"
+        "}\n"
         "Rules:\n"
-        "- Only include items you can reasonably see.\n"
-        "- Prefer shopper-friendly labels (e.g., 'microphone', 'sneakers', 'studio light').\n"
-        "- If timing is unknown (single image), set startTimeMs/endTimeMs to 0.\n"
-        "- Avoid people/body parts as 'objects'.\n"
+        "- labels must be short, lower-case.\n"
+        "- confidence must be 0..1.\n"
+        "- avoid people/body parts.\n"
+        + timing_hint
+    )
+
+    user_text = (
+        "Detect the most important shopping/product objects in these images.\n"
+        "If timeWindowMs hints are provided, attach the timing fields.\n"
     )
 
     content_parts: List[Dict[str, Any]] = [{"type": "input_text", "text": user_text}]
@@ -258,15 +258,27 @@ def _openai_detect_objects_from_images(
             start = time_windows_ms[i]["start"]
             end = time_windows_ms[i]["end"]
             content_parts.append(
-                {"type": "input_text", "text": f"Frame {i+1} timeWindowMs: start={start}, end={end}"}
+                {
+                    "type": "input_text",
+                    "text": f"Frame {i+1} timeWindowMs: start={start}, end={end}",
+                }
             )
+
         content_parts.append({"type": "input_image", "image_url": data_url})
 
     payload = {
         "model": OPENAI_MODEL,
-        "instructions": system_text,
-        "input": [{"role": "user", "content": content_parts}],
-        "text": {"format": {"type": "json_object"}},
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": content_parts,
+            },
+        ],
+        "max_output_tokens": 500,
     }
 
     headers = {
@@ -285,24 +297,31 @@ def _openai_detect_objects_from_images(
         raise HTTPException(status_code=502, detail=f"OpenAI request failed: {e}")
 
     if resp.status_code < 200 or resp.status_code >= 300:
-        raise HTTPException(status_code=502, detail=f"OpenAI error: {resp.status_code} {resp.text}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI error: {resp.status_code} {resp.text}",
+        )
 
     data = resp.json()
 
+    # Extract output text from Responses API
     output_text = ""
     for item in data.get("output", []):
         if item.get("type") == "message":
-            for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    output_text += c.get("text", "")
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    output_text += part.get("text", "")
 
     if not output_text.strip():
-        raise HTTPException(status_code=502, detail="OpenAI returned empty output_text")
+        raise HTTPException(status_code=502, detail="No output_text returned from OpenAI")
 
     try:
         parsed = json.loads(output_text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to parse OpenAI JSON: {e}. Raw: {output_text[:800]}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to parse OpenAI JSON: {e}. Raw: {output_text[:800]}",
+        )
 
     objs = parsed.get("objects", [])
     result: List[DetectResponseObject] = []
@@ -312,15 +331,18 @@ def _openai_detect_objects_from_images(
             result.append(
                 DetectResponseObject(
                     label=str(o.get("label", "")).strip(),
-                    confidence=float(o.get("confidence", 0.0)),
-                    startTimeMs=int(o.get("startTimeMs", 0)),
-                    endTimeMs=int(o.get("endTimeMs", 0)),
+                    confidence=float(o.get("confidence", 0)),
+                    startTimeMs=o.get("startTimeMs", None),
+                    endTimeMs=o.get("endTimeMs", None),
                 )
             )
         except Exception:
             continue
 
-    return [r for r in result if r.label]
+    # Remove empty labels
+    result = [r for r in result if r.label]
+
+    return result
 
 
 # -----------------------------
@@ -342,14 +364,14 @@ def detect_image(req: DetectImageRequest):
 
 @app.post("/v1/detect/image-upload", response_model=DetectResponse)
 async def detect_image_upload(postId: str, file: UploadFile = File(...)):
-    if not file.content_type or "image" not in file.content_type.lower():
-        raise HTTPException(status_code=400, detail="Upload must be an image")
+    if file.content_type and "image" not in file.content_type.lower():
+        raise HTTPException(status_code=400, detail="Upload must be an image file")
 
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Uploaded image was empty")
 
-    data_url = _bytes_to_data_url(image_bytes, file.content_type)
+    data_url = _bytes_to_data_url(image_bytes, "image/jpeg")
 
     objects = _openai_detect_objects_from_images(
         post_id=postId,
@@ -378,6 +400,7 @@ def detect_video(req: DetectVideoRequest):
         image_data_urls=frames_data_urls,
         time_windows_ms=time_windows,
     )
+
     return DetectResponse(postId=req.postId, objects=objects)
 
 
@@ -388,7 +411,7 @@ async def detect_video_upload(
     sampleFps: float = 1.0,
     maxFrames: int = 4,
 ):
-    if not _is_video_upload(file):
+    if file.content_type and "video" not in file.content_type.lower():
         raise HTTPException(status_code=400, detail="Upload must be a video file")
 
     video_bytes = await file.read()
@@ -410,4 +433,5 @@ async def detect_video_upload(
         image_data_urls=frames_data_urls,
         time_windows_ms=time_windows,
     )
+
     return DetectResponse(postId=postId, objects=objects)
