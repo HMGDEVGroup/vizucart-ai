@@ -3,7 +3,7 @@ import io
 import json
 import base64
 import tempfile
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import requests
 import cv2
@@ -68,12 +68,20 @@ def _download_bytes(url: str) -> bytes:
         "Accept": "*/*",
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=DOWNLOAD_TIMEOUT_SEC, allow_redirects=True)
+        resp = requests.get(
+            url,
+            headers=headers,
+            timeout=DOWNLOAD_TIMEOUT_SEC,
+            allow_redirects=True,
+        )
     except requests.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Failed to download URL: {e}")
 
     if resp.status_code < 200 or resp.status_code >= 300:
-        raise HTTPException(status_code=400, detail=f"Failed to download URL (status={resp.status_code})")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download URL (status={resp.status_code})",
+        )
 
     if not resp.content:
         raise HTTPException(status_code=400, detail="Downloaded content was empty")
@@ -82,7 +90,7 @@ def _download_bytes(url: str) -> bytes:
 
 
 def _bytes_to_data_url(image_bytes: bytes, mime: str) -> str:
-    # Responses API supports Base64 images as a "data URL" in image_url.  [oai_citation:2‡OpenAI Platform](https://platform.openai.com/docs/guides/images)
+    # Responses API supports Base64 images as a "data URL"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
@@ -97,10 +105,89 @@ def _infer_mime_from_url(url: str) -> str:
 
 
 def _jpeg_encode_bgr(frame_bgr) -> bytes:
-    ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    ok, buf = cv2.imencode(
+        ".jpg",
+        frame_bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 85],
+    )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to encode frame to JPEG")
     return buf.tobytes()
+
+
+# -----------------------------
+# Helper: Sample video frames from a local file path
+# -----------------------------
+def _sample_video_frames_from_path(
+    *,
+    video_path: str,
+    sample_fps: float,
+    max_frames: int,
+) -> Tuple[List[str], List[Dict[str, int]]]:
+    """
+    Returns:
+      frames_data_urls: list of base64 data URLs (JPEG frames)
+      time_windows: list of {"start":ms,"end":ms} for each frame
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=400, detail="Failed to open video")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 30.0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration_sec = (total_frames / fps) if total_frames > 0 else 0
+
+    # We want ~sample_fps frames per second, but cap at max_frames
+    sample_every_n = max(int(round(fps / max(sample_fps, 0.1))), 1)
+
+    frames_data_urls: List[str] = []
+    time_windows: List[Dict[str, int]] = []
+
+    frame_index = 0
+    grabbed = 0
+
+    while grabbed < max_frames:
+        ok = cap.grab()
+        if not ok:
+            break
+
+        if frame_index % sample_every_n == 0:
+            ok, frame = cap.retrieve()
+            if not ok or frame is None:
+                frame_index += 1
+                continue
+
+            jpeg_bytes = _jpeg_encode_bgr(frame)
+            data_url = _bytes_to_data_url(jpeg_bytes, "image/jpeg")
+
+            # Time window for this sampled frame
+            t_sec = frame_index / fps
+            start_ms = int(t_sec * 1000)
+
+            if duration_sec > 0:
+                end_sec = min(
+                    (t_sec + (1.0 / max(sample_fps, 0.1))),
+                    duration_sec,
+                )
+                end_ms = int(end_sec * 1000)
+            else:
+                end_ms = start_ms
+
+            frames_data_urls.append(data_url)
+            time_windows.append({"start": start_ms, "end": end_ms})
+            grabbed += 1
+
+        frame_index += 1
+
+    cap.release()
+
+    if not frames_data_urls:
+        raise HTTPException(status_code=400, detail="No frames sampled from video")
+
+    return frames_data_urls, time_windows
 
 
 # -----------------------------
@@ -120,8 +207,6 @@ def _openai_detect_objects_from_images(
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
-    # Instruction: return strict JSON we can parse.
-    # We ask for objects with confidence 0..1 and optional timing.
     timing_hint = ""
     if time_windows_ms and len(time_windows_ms) == len(image_data_urls):
         timing_hint = (
@@ -156,17 +241,23 @@ def _openai_detect_objects_from_images(
         "- Avoid people/body parts as 'objects'.\n"
     )
 
-    content_parts: List[Dict[str, Any]] = [{"type": "input_text", "text": user_text}]
+    content_parts: List[Dict[str, Any]] = [
+        {"type": "input_text", "text": user_text}
+    ]
 
-    # Add images as input_image. NOTE: field is image_url even for base64 data URLs.  [oai_citation:3‡OpenAI Platform](https://platform.openai.com/docs/guides/images)
     for i, data_url in enumerate(image_data_urls):
-        part = {"type": "input_image", "image_url": data_url}
-        # Optionally add a short per-frame time hint in the prompt itself.
+        # Optional per-frame hint
         if time_windows_ms and i < len(time_windows_ms):
             start = time_windows_ms[i]["start"]
             end = time_windows_ms[i]["end"]
-            content_parts.append({"type": "input_text", "text": f"Frame {i+1} timeWindowMs: start={start}, end={end}"})
-        content_parts.append(part)
+            content_parts.append(
+                {
+                    "type": "input_text",
+                    "text": f"Frame {i+1} timeWindowMs: start={start}, end={end}",
+                }
+            )
+
+        content_parts.append({"type": "input_image", "image_url": data_url})
 
     payload = {
         "model": OPENAI_MODEL,
@@ -186,18 +277,23 @@ def _openai_detect_objects_from_images(
     }
 
     try:
-        resp = requests.post(OPENAI_RESPONSES_URL, headers=headers, data=json.dumps(payload), timeout=60)
+        resp = requests.post(
+            OPENAI_RESPONSES_URL,
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=60,
+        )
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"OpenAI request failed: {e}")
 
     if resp.status_code < 200 or resp.status_code >= 300:
-        # Show the OpenAI error body so you can debug quickly.
-        raise HTTPException(status_code=502, detail=f"OpenAI error: {resp.status_code} {resp.text}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI error: {resp.status_code} {resp.text}",
+        )
 
     data = resp.json()
 
-    # Responses API returns text in output items; easiest robust path:
-    # Many SDKs expose response.output_text; here we parse manually.
     output_text = ""
     for item in data.get("output", []):
         if item.get("type") == "message":
@@ -211,10 +307,14 @@ def _openai_detect_objects_from_images(
     try:
         parsed = json.loads(output_text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to parse OpenAI JSON: {e}. Raw: {output_text[:800]}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to parse OpenAI JSON: {e}. Raw: {output_text[:800]}",
+        )
 
     objs = parsed.get("objects", [])
     result: List[DetectResponseObject] = []
+
     for o in objs:
         try:
             result.append(
@@ -226,12 +326,9 @@ def _openai_detect_objects_from_images(
                 )
             )
         except Exception:
-            # Skip malformed entries
             continue
 
-    # Remove empty labels
     result = [r for r in result if r.label]
-
     return result
 
 
@@ -240,7 +337,6 @@ def _openai_detect_objects_from_images(
 # -----------------------------
 @app.post("/v1/detect/image", response_model=DetectResponse)
 def detect_image(req: DetectImageRequest):
-    # Download image ourselves so we don't rely on OpenAI fetching URLs (more reliable).
     image_bytes = _download_bytes(req.imageUrl)
     mime = _infer_mime_from_url(req.imageUrl)
     data_url = _bytes_to_data_url(image_bytes, mime)
@@ -277,62 +373,17 @@ async def detect_image_upload(postId: str, file: UploadFile = File(...)):
 
 @app.post("/v1/detect/video", response_model=DetectResponse)
 def detect_video(req: DetectVideoRequest):
-    # Download video to temp file, then sample frames with OpenCV.
     video_bytes = _download_bytes(req.videoUrl)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
         tmp.write(video_bytes)
         tmp.flush()
 
-        cap = cv2.VideoCapture(tmp.name)
-        if not cap.isOpened():
-            raise HTTPException(status_code=400, detail="Failed to open video")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0:
-            fps = 30.0
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        duration_sec = total_frames / fps if total_frames > 0 else 0
-
-        # We want ~sampleFps frames per second, but cap at maxFrames.
-        sample_every_n = max(int(round(fps / max(req.sampleFps, 0.1))), 1)
-
-        frames_data_urls: List[str] = []
-        time_windows: List[Dict[str, int]] = []
-
-        frame_index = 0
-        grabbed = 0
-
-        while grabbed < req.maxFrames:
-            ok = cap.grab()
-            if not ok:
-                break
-
-            if frame_index % sample_every_n == 0:
-                ok, frame = cap.retrieve()
-                if not ok or frame is None:
-                    frame_index += 1
-                    continue
-
-                jpeg_bytes = _jpeg_encode_bgr(frame)
-                data_url = _bytes_to_data_url(jpeg_bytes, "image/jpeg")
-
-                # Time window for this sampled frame
-                t_sec = frame_index / fps
-                start_ms = int(t_sec * 1000)
-                end_ms = int(min((t_sec + (1.0 / max(req.sampleFps, 0.1))), duration_sec) * 1000) if duration_sec > 0 else start_ms
-
-                frames_data_urls.append(data_url)
-                time_windows.append({"start": start_ms, "end": end_ms})
-                grabbed += 1
-
-            frame_index += 1
-
-        cap.release()
-
-    if not frames_data_urls:
-        raise HTTPException(status_code=400, detail="No frames sampled from video")
+        frames_data_urls, time_windows = _sample_video_frames_from_path(
+            video_path=tmp.name,
+            sample_fps=req.sampleFps,
+            max_frames=req.maxFrames,
+        )
 
     objects = _openai_detect_objects_from_images(
         post_id=req.postId,
@@ -341,3 +392,37 @@ def detect_video(req: DetectVideoRequest):
     )
 
     return DetectResponse(postId=req.postId, objects=objects)
+
+
+@app.post("/v1/detect/video-upload", response_model=DetectResponse)
+async def detect_video_upload(
+    postId: str,
+    file: UploadFile = File(...),
+    sampleFps: float = 1.0,
+    maxFrames: int = 4,
+):
+    # Some browsers/devices send weird content types, so we don't over-reject here
+    if file.content_type and "video" not in file.content_type.lower():
+        raise HTTPException(status_code=400, detail="Upload must be a video file")
+
+    video_bytes = await file.read()
+    if not video_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded video was empty")
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
+        tmp.write(video_bytes)
+        tmp.flush()
+
+        frames_data_urls, time_windows = _sample_video_frames_from_path(
+            video_path=tmp.name,
+            sample_fps=sampleFps,
+            max_frames=maxFrames,
+        )
+
+    objects = _openai_detect_objects_from_images(
+        post_id=postId,
+        image_data_urls=frames_data_urls,
+        time_windows_ms=time_windows,
+    )
+
+    return DetectResponse(postId=postId, objects=objects)
