@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import base64
 import tempfile
@@ -52,6 +51,12 @@ class DetectResponse(BaseModel):
 # FastAPI
 # -----------------------------
 app = FastAPI(title="Vizucart AI", version="1.0.0")
+
+
+@app.get("/")
+def root():
+    # Prevent confusing 404s for Render HEAD/GET /
+    return {"name": "Vizucart AI", "status": "ok", "health": "/health", "docs": "/docs"}
 
 
 @app.get("/health")
@@ -116,6 +121,33 @@ def _jpeg_encode_bgr(frame_bgr) -> bytes:
 
 
 # -----------------------------
+# Helper: Validate video uploads (fixes curl octet-stream issue)
+# -----------------------------
+def _is_video_upload(file: UploadFile) -> bool:
+    """
+    Many clients (including curl) can send video as:
+      - Content-Type: application/octet-stream
+    even for .mp4 files.
+
+    We accept if:
+      - content-type starts with "video/"
+      - OR file extension is a known video extension
+      - OR content-type hints mp4/quicktime
+    """
+    ct = (file.content_type or "").lower().strip()
+    name = (file.filename or "").lower().strip()
+
+    if ct.startswith("video/"):
+        return True
+
+    if "mp4" in ct or "quicktime" in ct or "webm" in ct:
+        return True
+
+    # Accept extension-based validation (works with octet-stream)
+    return name.endswith((".mp4", ".mov", ".m4v", ".webm"))
+
+
+# -----------------------------
 # Helper: Sample video frames from a local file path
 # -----------------------------
 def _sample_video_frames_from_path(
@@ -140,7 +172,6 @@ def _sample_video_frames_from_path(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration_sec = (total_frames / fps) if total_frames > 0 else 0
 
-    # We want ~sample_fps frames per second, but cap at max_frames
     sample_every_n = max(int(round(fps / max(sample_fps, 0.1))), 1)
 
     frames_data_urls: List[str] = []
@@ -163,7 +194,6 @@ def _sample_video_frames_from_path(
             jpeg_bytes = _jpeg_encode_bgr(frame)
             data_url = _bytes_to_data_url(jpeg_bytes, "image/jpeg")
 
-            # Time window for this sampled frame
             t_sec = frame_index / fps
             start_ms = int(t_sec * 1000)
 
@@ -199,11 +229,6 @@ def _openai_detect_objects_from_images(
     image_data_urls: List[str],
     time_windows_ms: Optional[List[Dict[str, int]]] = None,
 ) -> List[DetectResponseObject]:
-    """
-    image_data_urls: list of data URLs ("data:image/jpeg;base64,...") or normal URLs.
-    time_windows_ms: optional list same length as images, with {"start":ms, "end":ms}
-    """
-
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
@@ -241,33 +266,21 @@ def _openai_detect_objects_from_images(
         "- Avoid people/body parts as 'objects'.\n"
     )
 
-    content_parts: List[Dict[str, Any]] = [
-        {"type": "input_text", "text": user_text}
-    ]
+    content_parts: List[Dict[str, Any]] = [{"type": "input_text", "text": user_text}]
 
     for i, data_url in enumerate(image_data_urls):
-        # Optional per-frame hint
         if time_windows_ms and i < len(time_windows_ms):
             start = time_windows_ms[i]["start"]
             end = time_windows_ms[i]["end"]
             content_parts.append(
-                {
-                    "type": "input_text",
-                    "text": f"Frame {i+1} timeWindowMs: start={start}, end={end}",
-                }
+                {"type": "input_text", "text": f"Frame {i+1} timeWindowMs: start={start}, end={end}"}
             )
-
         content_parts.append({"type": "input_image", "image_url": data_url})
 
     payload = {
         "model": OPENAI_MODEL,
         "instructions": system_text,
-        "input": [
-            {
-                "role": "user",
-                "content": content_parts,
-            }
-        ],
+        "input": [{"role": "user", "content": content_parts}],
         "text": {"format": {"type": "json_object"}},
     }
 
@@ -287,10 +300,7 @@ def _openai_detect_objects_from_images(
         raise HTTPException(status_code=502, detail=f"OpenAI request failed: {e}")
 
     if resp.status_code < 200 or resp.status_code >= 300:
-        raise HTTPException(
-            status_code=502,
-            detail=f"OpenAI error: {resp.status_code} {resp.text}",
-        )
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {resp.status_code} {resp.text}")
 
     data = resp.json()
 
@@ -314,7 +324,6 @@ def _openai_detect_objects_from_images(
 
     objs = parsed.get("objects", [])
     result: List[DetectResponseObject] = []
-
     for o in objs:
         try:
             result.append(
@@ -328,8 +337,7 @@ def _openai_detect_objects_from_images(
         except Exception:
             continue
 
-    result = [r for r in result if r.label]
-    return result
+    return [r for r in result if r.label]
 
 
 # -----------------------------
@@ -359,8 +367,7 @@ async def detect_image_upload(postId: str, file: UploadFile = File(...)):
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Uploaded image was empty")
 
-    mime = file.content_type
-    data_url = _bytes_to_data_url(image_bytes, mime)
+    data_url = _bytes_to_data_url(image_bytes, file.content_type)
 
     objects = _openai_detect_objects_from_images(
         post_id=postId,
@@ -401,8 +408,8 @@ async def detect_video_upload(
     sampleFps: float = 1.0,
     maxFrames: int = 4,
 ):
-    # Some browsers/devices send weird content types, so we don't over-reject here
-    if file.content_type and "video" not in file.content_type.lower():
+    # ✅ Robust: don't falsely reject curl uploads (octet-stream)
+    if not _is_video_upload(file):
         raise HTTPException(status_code=400, detail="Upload must be a video file")
 
     video_bytes = await file.read()
