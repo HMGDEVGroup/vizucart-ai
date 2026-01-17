@@ -95,7 +95,6 @@ def _download_bytes(url: str) -> bytes:
 
 
 def _bytes_to_data_url(image_bytes: bytes, mime: str) -> str:
-    # Responses API supports Base64 images as a "data URL"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
@@ -121,29 +120,23 @@ def _jpeg_encode_bgr(frame_bgr) -> bytes:
 
 
 # -----------------------------
-# Helper: Validate video uploads (fixes curl octet-stream issue)
+# Helper: Validate video uploads (robust for curl/octet-stream)
 # -----------------------------
 def _is_video_upload(file: UploadFile) -> bool:
-    """
-    Many clients (including curl) can send video as:
-      - Content-Type: application/octet-stream
-    even for .mp4 files.
-
-    We accept if:
-      - content-type starts with "video/"
-      - OR file extension is a known video extension
-      - OR content-type hints mp4/quicktime
-    """
     ct = (file.content_type or "").lower().strip()
     name = (file.filename or "").lower().strip()
 
     if ct.startswith("video/"):
         return True
 
+    # Some clients send octet-stream; trust extension
+    if ct in ("application/octet-stream", ""):
+        return name.endswith((".mp4", ".mov", ".m4v", ".webm"))
+
+    # Other hints
     if "mp4" in ct or "quicktime" in ct or "webm" in ct:
         return True
 
-    # Accept extension-based validation (works with octet-stream)
     return name.endswith((".mp4", ".mov", ".m4v", ".webm"))
 
 
@@ -156,11 +149,6 @@ def _sample_video_frames_from_path(
     sample_fps: float,
     max_frames: int,
 ) -> Tuple[List[str], List[Dict[str, int]]]:
-    """
-    Returns:
-      frames_data_urls: list of base64 data URLs (JPEG frames)
-      time_windows: list of {"start":ms,"end":ms} for each frame
-    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise HTTPException(status_code=400, detail="Failed to open video")
@@ -170,8 +158,9 @@ def _sample_video_frames_from_path(
         fps = 30.0
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration_sec = (total_frames / fps) if total_frames > 0 else 0
+    duration_sec = (total_frames / fps) if total_frames > 0 else 0.0
 
+    # Want ~sample_fps frames per second, cap at max_frames
     sample_every_n = max(int(round(fps / max(sample_fps, 0.1))), 1)
 
     frames_data_urls: List[str] = []
@@ -192,21 +181,17 @@ def _sample_video_frames_from_path(
                 continue
 
             jpeg_bytes = _jpeg_encode_bgr(frame)
-            data_url = _bytes_to_data_url(jpeg_bytes, "image/jpeg")
+            frames_data_urls.append(_bytes_to_data_url(jpeg_bytes, "image/jpeg"))
 
             t_sec = frame_index / fps
             start_ms = int(t_sec * 1000)
 
             if duration_sec > 0:
-                end_sec = min(
-                    (t_sec + (1.0 / max(sample_fps, 0.1))),
-                    duration_sec,
-                )
+                end_sec = min(t_sec + (1.0 / max(sample_fps, 0.1)), duration_sec)
                 end_ms = int(end_sec * 1000)
             else:
                 end_ms = start_ms
 
-            frames_data_urls.append(data_url)
             time_windows.append({"start": start_ms, "end": end_ms})
             grabbed += 1
 
@@ -317,13 +302,11 @@ def _openai_detect_objects_from_images(
     try:
         parsed = json.loads(output_text)
     except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to parse OpenAI JSON: {e}. Raw: {output_text[:800]}",
-        )
+        raise HTTPException(status_code=502, detail=f"Failed to parse OpenAI JSON: {e}. Raw: {output_text[:800]}")
 
     objs = parsed.get("objects", [])
     result: List[DetectResponseObject] = []
+
     for o in objs:
         try:
             result.append(
@@ -354,7 +337,6 @@ def detect_image(req: DetectImageRequest):
         image_data_urls=[data_url],
         time_windows_ms=None,
     )
-
     return DetectResponse(postId=req.postId, objects=objects)
 
 
@@ -374,7 +356,6 @@ async def detect_image_upload(postId: str, file: UploadFile = File(...)):
         image_data_urls=[data_url],
         time_windows_ms=None,
     )
-
     return DetectResponse(postId=postId, objects=objects)
 
 
@@ -397,7 +378,6 @@ def detect_video(req: DetectVideoRequest):
         image_data_urls=frames_data_urls,
         time_windows_ms=time_windows,
     )
-
     return DetectResponse(postId=req.postId, objects=objects)
 
 
@@ -408,7 +388,6 @@ async def detect_video_upload(
     sampleFps: float = 1.0,
     maxFrames: int = 4,
 ):
-    # ✅ Robust: don't falsely reject curl uploads (octet-stream)
     if not _is_video_upload(file):
         raise HTTPException(status_code=400, detail="Upload must be a video file")
 
@@ -431,5 +410,4 @@ async def detect_video_upload(
         image_data_urls=frames_data_urls,
         time_windows_ms=time_windows,
     )
-
     return DetectResponse(postId=postId, objects=objects)
