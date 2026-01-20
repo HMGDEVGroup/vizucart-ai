@@ -41,8 +41,15 @@ class DetectResponseObject(BaseModel):
     endTimeMs: int = 0
 
 
+# ✅ Option A: Rich response model
 class DetectResponse(BaseModel):
     postId: str
+    title: str = ""
+    brand: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    keywords: List[str] = []
+    suggestedCategories: List[str] = []
+    notes: str = ""
     objects: List[DetectResponseObject]
 
 
@@ -52,7 +59,7 @@ class DetectResponse(BaseModel):
 app = FastAPI(title="Vizucart AI", version="1.0.0")
 
 
-# Root helpers (avoid 404/405 noise + make Render happy)
+# Root helpers
 @app.get("/")
 def root():
     return {"name": "Vizucart AI", "status": "ok", "docs": "/docs", "health": "/health"}
@@ -185,12 +192,15 @@ def _sample_video_frames_from_path(
     return frames_data_urls, time_windows
 
 
-def _openai_detect_objects_from_images(
+# -----------------------------
+# OpenAI helper (Option A)
+# -----------------------------
+def _openai_detect_metadata_and_objects_from_images(
     *,
     post_id: str,
     image_data_urls: List[str],
     time_windows_ms: Optional[List[Dict[str, int]]] = None,
-) -> List[DetectResponseObject]:
+) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
@@ -202,16 +212,23 @@ def _openai_detect_objects_from_images(
         )
 
     system_text = (
-        "You are Vizucart's object detection assistant. "
-        "Identify tangible, shoppable items in the image(s). "
+        "You are Vizucart's shopping metadata assistant. "
+        "Identify shoppable items and produce product-friendly metadata. "
         "Return ONLY valid JSON (no markdown)."
     )
 
+    # ✅ NEW schema includes: title/brand/confidence/keywords/suggestedCategories/notes/objects
     user_text = (
         f"PostId: {post_id}\n"
         f"{timing_hint}\n\n"
         "Return JSON with this exact schema:\n"
         "{\n"
+        '  "title": string,\n'
+        '  "brand": string,\n'
+        '  "confidence": number (0 to 1),\n'
+        '  "keywords": [string],\n'
+        '  "suggestedCategories": [string],\n'
+        '  "notes": string,\n'
         '  "objects": [\n'
         "    {\n"
         '      "label": string,\n'
@@ -222,10 +239,14 @@ def _openai_detect_objects_from_images(
         "  ]\n"
         "}\n\n"
         "Rules:\n"
-        "- Only include items you can reasonably see.\n"
-        "- Prefer shopper-friendly labels (e.g., 'microphone', 'sneakers', 'studio light').\n"
+        "- title: a shopper-friendly primary item name (singular), e.g. 'milk frother', 'hoodie', 'tripod'.\n"
+        "- brand: ONLY if clearly visible (logo/text/packaging). Otherwise return empty string \"\".\n"
+        "- confidence: confidence for the title (0..1). If unsure, set lower.\n"
+        "- keywords: 5-15 helpful search terms (include object labels + context like 'kitchen', 'camera', etc.).\n"
+        "- suggestedCategories: 1-5 ecommerce categories, broad-to-specific.\n"
+        "- notes: short helpful note; mention uncertainty if brand/model not visible.\n"
+        "- objects: tangible shoppable items ONLY (avoid people/body parts).\n"
         "- If timing is unknown (single image), set startTimeMs/endTimeMs to 0.\n"
-        "- Avoid people/body parts as 'objects'.\n"
     )
 
     content_parts: List[Dict[str, Any]] = [{"type": "input_text", "text": user_text}]
@@ -235,12 +256,8 @@ def _openai_detect_objects_from_images(
             start = time_windows_ms[i]["start"]
             end = time_windows_ms[i]["end"]
             content_parts.append(
-                {
-                    "type": "input_text",
-                    "text": f"Frame {i+1} timeWindowMs: start={start}, end={end}",
-                }
+                {"type": "input_text", "text": f"Frame {i+1} timeWindowMs: start={start}, end={end}"}
             )
-
         content_parts.append({"type": "input_image", "image_url": data_url})
 
     payload = {
@@ -288,22 +305,69 @@ def _openai_detect_objects_from_images(
             detail=f"Failed to parse OpenAI JSON: {e}. Raw: {output_text[:800]}",
         )
 
-    objs = parsed.get("objects", [])
-    result: List[DetectResponseObject] = []
-    for o in objs:
-        try:
-            result.append(
-                DetectResponseObject(
-                    label=str(o.get("label", "")).strip(),
-                    confidence=float(o.get("confidence", 0.0)),
-                    startTimeMs=int(o.get("startTimeMs", 0)),
-                    endTimeMs=int(o.get("endTimeMs", 0)),
-                )
-            )
-        except Exception:
-            continue
+    # ---- Extract rich fields safely ----
+    title = str(parsed.get("title", "") or "").strip()
+    brand = str(parsed.get("brand", "") or "").strip()
+    try:
+        confidence = float(parsed.get("confidence", 0.0) or 0.0)
+    except Exception:
+        confidence = 0.0
 
-    return [r for r in result if r.label]
+    keywords_raw = parsed.get("keywords", []) or []
+    keywords = []
+    if isinstance(keywords_raw, list):
+        keywords = [str(k).strip() for k in keywords_raw if str(k).strip()]
+
+    suggested_raw = parsed.get("suggestedCategories", []) or []
+    suggested = []
+    if isinstance(suggested_raw, list):
+        suggested = [str(s).strip() for s in suggested_raw if str(s).strip()]
+
+    notes = str(parsed.get("notes", "") or "").strip()
+
+    # ---- Objects ----
+    objs = parsed.get("objects", []) or []
+    objects_list: List[DetectResponseObject] = []
+    if isinstance(objs, list):
+        for o in objs:
+            try:
+                objects_list.append(
+                    DetectResponseObject(
+                        label=str(o.get("label", "")).strip(),
+                        confidence=float(o.get("confidence", 0.0)),
+                        startTimeMs=int(o.get("startTimeMs", 0)),
+                        endTimeMs=int(o.get("endTimeMs", 0)),
+                    )
+                )
+            except Exception:
+                continue
+
+    # Filter empty labels
+    objects_list = [r for r in objects_list if r.label]
+
+    # If model forgot to set title, derive from top object
+    if not title and objects_list:
+        objects_sorted = sorted(objects_list, key=lambda x: x.confidence, reverse=True)
+        title = objects_sorted[0].label
+
+    # Clamp confidence
+    confidence = max(0.0, min(1.0, confidence))
+
+    if not notes:
+        if brand:
+            notes = "Detected item and brand from visible packaging/logo."
+        else:
+            notes = "Brand/model not clearly visible. Confirm during product match."
+
+    return {
+        "title": title,
+        "brand": brand,
+        "confidence": confidence,
+        "keywords": keywords,
+        "suggestedCategories": suggested,
+        "notes": notes,
+        "objects": objects_list,
+    }
 
 
 # -----------------------------
@@ -315,12 +379,13 @@ def detect_image(req: DetectImageRequest):
     mime = _infer_mime_from_url(req.imageUrl)
     data_url = _bytes_to_data_url(image_bytes, mime)
 
-    objects = _openai_detect_objects_from_images(
+    result = _openai_detect_metadata_and_objects_from_images(
         post_id=req.postId,
         image_data_urls=[data_url],
         time_windows_ms=None,
     )
-    return DetectResponse(postId=req.postId, objects=objects)
+
+    return DetectResponse(postId=req.postId, **result)
 
 
 @app.post("/v1/detect/image-upload", response_model=DetectResponse)
@@ -334,12 +399,13 @@ async def detect_image_upload(postId: str, file: UploadFile = File(...)):
 
     data_url = _bytes_to_data_url(image_bytes, file.content_type)
 
-    objects = _openai_detect_objects_from_images(
+    result = _openai_detect_metadata_and_objects_from_images(
         post_id=postId,
         image_data_urls=[data_url],
         time_windows_ms=None,
     )
-    return DetectResponse(postId=postId, objects=objects)
+
+    return DetectResponse(postId=postId, **result)
 
 
 @app.post("/v1/detect/video", response_model=DetectResponse)
@@ -356,12 +422,13 @@ def detect_video(req: DetectVideoRequest):
             max_frames=req.maxFrames,
         )
 
-    objects = _openai_detect_objects_from_images(
+    result = _openai_detect_metadata_and_objects_from_images(
         post_id=req.postId,
         image_data_urls=frames_data_urls,
         time_windows_ms=time_windows,
     )
-    return DetectResponse(postId=req.postId, objects=objects)
+
+    return DetectResponse(postId=req.postId, **result)
 
 
 @app.post("/v1/detect/video-upload", response_model=DetectResponse)
@@ -385,9 +452,10 @@ async def detect_video_upload(
             max_frames=maxFrames,
         )
 
-    objects = _openai_detect_objects_from_images(
+    result = _openai_detect_metadata_and_objects_from_images(
         post_id=postId,
         image_data_urls=frames_data_urls,
         time_windows_ms=time_windows,
     )
-    return DetectResponse(postId=postId, objects=objects)
+
+    return DetectResponse(postId=postId, **result)
